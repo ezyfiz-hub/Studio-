@@ -1,0 +1,945 @@
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { Play, Pause, RefreshCw, Maximize, Settings, Plus, Trash2, Power, AlertCircle, MessageSquare, Gamepad2, Activity, Save, Download, Upload } from 'lucide-react';
+
+
+// --- TYPES ---
+type CommandType = 'enemy_spawn' | 'boss_spawn' | 'player_heal' | 'random_event' | 'add_coin' | 'speed_up' | 'reset_game';
+
+interface GiftEvent {
+  id: string;
+  type: 'gift';
+  username: string;
+  giftId: string;
+  giftName: string;
+  quantity: number;
+  timestamp: number;
+}
+
+interface TriggerRule {
+  id: string;
+  giftId: string;
+  giftName: string;
+  command: CommandType;
+  value: number;
+  cooldown: number; // in milliseconds
+  enabled: boolean;
+}
+
+interface GameCommand {
+  id: string;
+  command: CommandType;
+  value: number;
+  timestamp: number;
+}
+
+interface LogEntry {
+  id: string;
+  time: string;
+  type: 'info' | 'trigger' | 'command' | 'game' | 'error';
+  message: string;
+}
+
+// --- EVENT BUS (Simulating WebSocket/Backend Communication) ---
+// This maintains the modular architecture within a single file.
+class EventBus {
+  private listeners: Record<string, Function[]> = {};
+
+  on(event: string, callback: Function) {
+    if (!this.listeners[event]) this.listeners[event] = [];
+    this.listeners[event].push(callback);
+  }
+
+  off(event: string, callback: Function) {
+    if (!this.listeners[event]) return;
+    this.listeners[event] = this.listeners[event].filter(cb => cb !== callback);
+  }
+
+  emit(event: string, data?: any) {
+    if (!this.listeners[event]) return;
+    this.listeners[event].forEach(cb => {
+      try { cb(data); } catch (e) { console.error(`Error in event listener for ${event}:`, e); }
+    });
+  }
+}
+
+const bus = new EventBus();
+
+// Available Gifts for Mocking
+const AVAILABLE_GIFTS = [
+  { id: 'rose', name: 'Rose', icon: '🌹' },
+  { id: 'heart', name: 'Heart', icon: '❤️' },
+  { id: 'coffee', name: 'Coffee', icon: '☕' },
+  { id: 'lion', name: 'Lion', icon: '🦁' },
+  { id: 'universe', name: 'TikTok Universe', icon: '🌌' },
+];
+
+const AVAILABLE_COMMANDS: CommandType[] = [
+  'enemy_spawn', 'boss_spawn', 'player_heal', 'random_event', 'add_coin', 'speed_up', 'reset_game'
+];
+
+
+// --- GAME ENGINE (Canvas API) ---
+class GameEngine {
+  private canvas: HTMLCanvasElement;
+  private ctx: CanvasRenderingContext2D;
+  private animationId: number = 0;
+  private isRunning: boolean = false;
+  private lastTime: number = 0;
+  
+  // Game State
+  private player = { x: 0, y: 0, size: 20, hp: 100, maxHp: 100, color: '#3b82f6' };
+  private enemies: any[] = [];
+  private particles: any[] = [];
+  private score = 0;
+  private coins = 0;
+  
+  // Command Queue for Event Safety (Batching/Rate Limiting)
+  private commandQueue: GameCommand[] = [];
+  private spawnQueue: number = 0;
+  private bossSpawnQueue: number = 0;
+
+  constructor(canvas: HTMLCanvasElement) {
+    this.canvas = canvas;
+    this.ctx = canvas.getContext('2d')!;
+    this.resize();
+    this.reset();
+  }
+
+  resize() {
+    const parent = this.canvas.parentElement;
+    if (parent) {
+      this.canvas.width = parent.clientWidth;
+      this.canvas.height = parent.clientHeight;
+      this.player.x = this.canvas.width / 2;
+      this.player.y = this.canvas.height / 2;
+    }
+  }
+
+  reset() {
+    this.player.hp = this.player.maxHp;
+    this.enemies = [];
+    this.particles = [];
+    this.score = 0;
+    this.coins = 0;
+    this.commandQueue = [];
+    this.spawnQueue = 0;
+    this.bossSpawnQueue = 0;
+    bus.emit('GAME_LOG', 'Game reset');
+  }
+
+  start() {
+    if (this.isRunning) return;
+    this.isRunning = true;
+    this.lastTime = performance.now();
+    this.loop(this.lastTime);
+    bus.emit('GAME_LOG', 'Game engine started');
+  }
+
+  pause() {
+    this.isRunning = false;
+    cancelAnimationFrame(this.animationId);
+    bus.emit('GAME_LOG', 'Game engine paused');
+  }
+
+  // --- COMMAND API ---
+  executeCommand(cmd: GameCommand) {
+    // Queue command for safety, processed in game loop
+    this.commandQueue.push(cmd);
+  }
+
+  private processCommands() {
+    while (this.commandQueue.length > 0) {
+      const cmd = this.commandQueue.shift()!;
+      switch (cmd.command) {
+        case 'enemy_spawn':
+          this.spawnQueue += cmd.value;
+          bus.emit('GAME_LOG', `Queued ${cmd.value} enemies`);
+          break;
+        case 'boss_spawn':
+          this.bossSpawnQueue += cmd.value;
+          bus.emit('GAME_LOG', `Queued ${cmd.value} bosses`);
+          break;
+        case 'player_heal':
+          this.player.hp = Math.min(this.player.maxHp, this.player.hp + cmd.value);
+          this.createFloatingText(`+${cmd.value} HP`, this.player.x, this.player.y, '#10b981');
+          bus.emit('GAME_LOG', `Player healed by ${cmd.value}`);
+          break;
+        case 'add_coin':
+          this.coins += cmd.value;
+          this.createFloatingText(`+${cmd.value} COINS`, this.player.x, this.player.y, '#fbbf24');
+          bus.emit('GAME_LOG', `Added ${cmd.value} coins`);
+          break;
+        case 'reset_game':
+          this.reset();
+          break;
+        case 'random_event':
+           // simple random event implementation
+           for(let i=0; i<30; i++) this.createParticle(this.canvas.width/2, this.canvas.height/2, '#a855f7');
+           this.spawnQueue += 5;
+           this.player.hp = Math.min(this.player.maxHp, this.player.hp + 20);
+           bus.emit('GAME_LOG', `Random Event Triggered!`);
+           break;
+      }
+    }
+  }
+
+  private spawnEntities() {
+    // Rate limit spawning (max 5 per frame) to prevent crashes from spam
+    const spawnsThisFrame = Math.min(this.spawnQueue, 5);
+    for (let i = 0; i < spawnsThisFrame; i++) {
+      this.enemies.push({
+        x: Math.random() > 0.5 ? 0 : this.canvas.width,
+        y: Math.random() * this.canvas.height,
+        size: 10 + Math.random() * 10,
+        speed: 1 + Math.random() * 2,
+        color: '#ef4444',
+        type: 'normal',
+        hp: 10
+      });
+      this.spawnQueue--;
+    }
+
+    if (this.bossSpawnQueue > 0) {
+      this.enemies.push({
+        x: this.canvas.width / 2,
+        y: -50,
+        size: 40,
+        speed: 0.5,
+        color: '#f97316',
+        type: 'boss',
+        hp: 100
+      });
+      this.bossSpawnQueue--;
+    }
+  }
+
+  private createParticle(x: number, y: number, color: string) {
+    this.particles.push({
+      x, y,
+      vx: (Math.random() - 0.5) * 10,
+      vy: (Math.random() - 0.5) * 10,
+      life: 1,
+      color,
+      size: Math.random() * 5 + 2
+    });
+  }
+
+  private createFloatingText(text: string, x: number, y: number, color: string) {
+    this.particles.push({
+      x, y,
+      text,
+      life: 1,
+      color,
+      vy: -2,
+      isText: true
+    });
+  }
+
+  private update(deltaTime: number) {
+    this.processCommands();
+    this.spawnEntities();
+
+    // Update enemies
+    for (let i = this.enemies.length - 1; i >= 0; i--) {
+      const e = this.enemies[i];
+      // Move towards player
+      const dx = this.player.x - e.x;
+      const dy = this.player.y - e.y;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      
+      e.x += (dx / dist) * e.speed;
+      e.y += (dy / dist) * e.speed;
+
+      // Collision with player
+      if (dist < this.player.size + e.size) {
+        this.player.hp -= e.type === 'boss' ? 20 : 5;
+        this.createParticle(e.x, e.y, e.color);
+        this.enemies.splice(i, 1);
+        if (this.player.hp <= 0) {
+          this.createFloatingText("GAME OVER", this.canvas.width/2, this.canvas.height/2, '#ef4444');
+          // Don't fully stop, just reset hp so demo continues
+          setTimeout(() => this.player.hp = this.player.maxHp, 2000); 
+        }
+      } else if (dist < 100 && Math.random() < 0.02) {
+         // Auto attack nearby enemies
+         e.hp -= 10;
+         this.createParticle(e.x, e.y, '#3b82f6');
+         if(e.hp <= 0) {
+             this.enemies.splice(i, 1);
+             this.score += e.type === 'boss' ? 100 : 10;
+             for(let j=0; j<5; j++) this.createParticle(e.x, e.y, e.color);
+         }
+      }
+    }
+
+    // Update particles
+    for (let i = this.particles.length - 1; i >= 0; i--) {
+      const p = this.particles[i];
+      p.x += p.vx || 0;
+      p.y += p.vy || 0;
+      p.life -= 0.02;
+      if (p.life <= 0) this.particles.splice(i, 1);
+    }
+  }
+
+  private draw() {
+    this.ctx.fillStyle = '#111827'; // Dark background
+    this.ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
+
+    // Draw Grid
+    this.ctx.strokeStyle = '#1f2937';
+    this.ctx.lineWidth = 1;
+    for(let i=0; i<this.canvas.width; i+=50) {
+        this.ctx.beginPath(); this.ctx.moveTo(i, 0); this.ctx.lineTo(i, this.canvas.height); this.ctx.stroke();
+    }
+    for(let i=0; i<this.canvas.height; i+=50) {
+        this.ctx.beginPath(); this.ctx.moveTo(0, i); this.ctx.lineTo(this.canvas.width, i); this.ctx.stroke();
+    }
+
+    // Draw Player
+    this.ctx.fillStyle = this.player.color;
+    this.ctx.beginPath();
+    this.ctx.arc(this.player.x, this.player.y, this.player.size, 0, Math.PI * 2);
+    this.ctx.fill();
+    
+    // Player HP Bar (World space)
+    this.ctx.fillStyle = '#ef4444';
+    this.ctx.fillRect(this.player.x - 20, this.player.y + 25, 40, 5);
+    this.ctx.fillStyle = '#10b981';
+    this.ctx.fillRect(this.player.x - 20, this.player.y + 25, 40 * (this.player.hp / this.player.maxHp), 5);
+
+    // Draw Enemies
+    this.enemies.forEach(e => {
+      this.ctx.fillStyle = e.color;
+      this.ctx.beginPath();
+      if (e.type === 'boss') {
+        this.ctx.rect(e.x - e.size/2, e.y - e.size/2, e.size, e.size);
+      } else {
+        this.ctx.arc(e.x, e.y, e.size, 0, Math.PI * 2);
+      }
+      this.ctx.fill();
+    });
+
+    // Draw Particles
+    this.particles.forEach(p => {
+      if (p.isText) {
+        this.ctx.fillStyle = p.color;
+        this.ctx.globalAlpha = p.life;
+        this.ctx.font = 'bold 16px Inter';
+        this.ctx.textAlign = 'center';
+        this.ctx.fillText(p.text, p.x, p.y);
+        this.ctx.globalAlpha = 1.0;
+      } else {
+        this.ctx.fillStyle = p.color;
+        this.ctx.globalAlpha = p.life;
+        this.ctx.beginPath();
+        this.ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+        this.ctx.fill();
+        this.ctx.globalAlpha = 1.0;
+      }
+    });
+
+    // Draw HUD
+    this.ctx.fillStyle = 'white';
+    this.ctx.font = 'bold 20px Inter';
+    this.ctx.textAlign = 'left';
+    this.ctx.fillText(`Score: ${this.score}`, 20, 30);
+    this.ctx.fillStyle = '#fbbf24';
+    this.ctx.fillText(`Coins: ${this.coins}`, 20, 60);
+    
+    this.ctx.fillStyle = 'rgba(255,255,255,0.5)';
+    this.ctx.font = '12px Inter';
+    this.ctx.fillText(`Enemies: ${this.enemies.length} | Spawn Queue: ${this.spawnQueue}`, 20, this.canvas.height - 20);
+  }
+
+  private loop = (time: number) => {
+    if (!this.isRunning) return;
+    const deltaTime = time - this.lastTime;
+    this.lastTime = time;
+
+    this.update(deltaTime);
+    this.draw();
+
+    this.animationId = requestAnimationFrame(this.loop);
+  };
+}
+
+
+// --- TRIGGER ENGINE ---
+// Evaluates incoming raw events against user defined rules.
+class TriggerEngine {
+    private rules: TriggerRule[] = [];
+    private lastTriggered: Record<string, number> = {};
+
+    setRules(rules: TriggerRule[]) {
+        this.rules = rules;
+    }
+
+    processEvent(event: GiftEvent) {
+        bus.emit('SYSTEM_LOG', { type: 'info', message: `Gift Received: ${event.giftName} x${event.quantity} from @${event.username}` });
+
+        const matchedRules = this.rules.filter(r => r.enabled && r.giftId === event.giftId);
+        
+        if (matchedRules.length === 0) return;
+
+        const now = Date.now();
+
+        matchedRules.forEach(rule => {
+            const lastTime = this.lastTriggered[rule.id] || 0;
+            if (now - lastTime < rule.cooldown) {
+                bus.emit('SYSTEM_LOG', { type: 'error', message: `Trigger ignored (Cooldown): ${rule.command}` });
+                return;
+            }
+
+            this.lastTriggered[rule.id] = now;
+            
+            // Generate command based on rule and event quantity
+            // Rate limiting/batching is handled by the GameEngine queue
+            const command: GameCommand = {
+                id: Math.random().toString(36).substr(2, 9),
+                command: rule.command,
+                value: rule.value * event.quantity, 
+                timestamp: now
+            };
+
+            bus.emit('SYSTEM_LOG', { type: 'trigger', message: `Trigger Matched: ${rule.giftName} -> ${rule.command} x${command.value}` });
+            bus.emit('COMMAND_DISPATCH', command);
+        });
+    }
+}
+
+const triggerEngine = new TriggerEngine();
+
+
+// --- CUSTOM HOOKS ---
+function useLocalStorage<T>(key: string, initialValue: T) {
+  const [storedValue, setStoredValue] = useState<T>(() => {
+    try {
+      const item = window.localStorage.getItem(key);
+      return item ? JSON.parse(item) : initialValue;
+    } catch (error) {
+      console.error(error);
+      return initialValue;
+    }
+  });
+
+  const setValue = (value: T | ((val: T) => T)) => {
+    try {
+      const valueToStore = value instanceof Function ? value(storedValue) : value;
+      setStoredValue(valueToStore);
+      window.localStorage.setItem(key, JSON.stringify(valueToStore));
+    } catch (error) {
+      console.error(error);
+    }
+  };
+  return [storedValue, setValue] as const;
+}
+
+// --- COMPONENTS ---
+
+const Panel = ({ title, icon: Icon, children, action }: any) => (
+  <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden flex flex-col h-full shadow-lg">
+    <div className="bg-gray-950 px-4 py-3 border-b border-gray-800 flex items-center justify-between">
+      <div className="flex items-center gap-2">
+        <Icon size={18} className="text-gray-400" />
+        <h3 className="font-semibold text-gray-200 text-sm tracking-wide">{title}</h3>
+      </div>
+      {action && <div>{action}</div>}
+    </div>
+    <div className="p-4 flex-1 overflow-auto custom-scrollbar">
+      {children}
+    </div>
+  </div>
+);
+
+// --- MAIN APP COMPONENT ---
+export default function App() {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const gameRef = useRef<GameEngine | null>(null);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  
+  // State
+  const [triggers, setTriggers] = useLocalStorage<TriggerRule[]>('live-trigger-rules', [
+    { id: '1', giftId: 'rose', giftName: 'Rose', command: 'enemy_spawn', value: 1, cooldown: 0, enabled: true },
+    { id: '2', giftId: 'heart', giftName: 'Heart', command: 'player_heal', value: 10, cooldown: 2000, enabled: true },
+    { id: '3', giftId: 'lion', giftName: 'Lion', command: 'boss_spawn', value: 1, cooldown: 10000, enabled: true },
+    { id: '4', giftId: 'universe', giftName: 'TikTok Universe', command: 'random_event', value: 1, cooldown: 5000, enabled: true },
+  ]);
+  const [logs, setLogs] = useState<LogEntry[]>([]);
+  
+  const [liveUsername, setLiveUsername] = useLocalStorage('tiktok-username', '');
+  const wsRef = useRef<WebSocket | null>(null);
+  const [connectionStatus, setConnectionStatus] = useState<'ready'|'connecting'|'live'>('ready');
+  
+  // Test Form State
+  const [testGift, setTestGift] = useState('rose');
+  const [testQty, setTestQty] = useState(1);
+  const [testUser, setTestUser] = useState('TestViewer');
+
+  
+  useEffect(() => {
+    // Initialize Game Engine
+    if (canvasRef.current && !gameRef.current) {
+      gameRef.current = new GameEngine(canvasRef.current);
+      gameRef.current.start();
+
+      const handleResize = () => gameRef.current?.resize();
+      window.addEventListener('resize', handleResize);
+      return () => window.removeEventListener('resize', handleResize);
+    }
+  }, []);
+
+  useEffect(() => {
+    // Update Trigger Engine Rules when state changes
+    triggerEngine.setRules(triggers);
+  }, [triggers]);
+
+  useEffect(() => {
+    // Event Wiring (The Adapter Architecture)
+    const handleRawEvent = (event: GiftEvent) => {
+        triggerEngine.processEvent(event);
+    };
+
+    const handleCommand = (command: GameCommand) => {
+        bus.emit('SYSTEM_LOG', { type: 'command', message: `Dispatching: ${command.command} x${command.value}` });
+        gameRef.current?.executeCommand(command);
+    };
+
+    const handleLog = (log: Omit<LogEntry, 'id' | 'time'>) => {
+        setLogs(prev => {
+            const newLogs = [{ 
+                ...log, 
+                id: Math.random().toString(36).substr(2,9),
+                time: new Date().toLocaleTimeString('en-US', { hour12: false })
+            }, ...prev].slice(0, 100); // Keep last 100
+            return newLogs;
+        });
+    };
+
+    const handleGameLog = (msg: string) => {
+        handleLog({ type: 'game', message: msg });
+    };
+
+    bus.on('RAW_EVENT', handleRawEvent);
+    bus.on('COMMAND_DISPATCH', handleCommand);
+    bus.on('SYSTEM_LOG', handleLog);
+    bus.on('GAME_LOG', handleGameLog);
+
+    return () => {
+        bus.off('RAW_EVENT', handleRawEvent);
+        bus.off('COMMAND_DISPATCH', handleCommand);
+        bus.off('SYSTEM_LOG', handleLog);
+        bus.off('GAME_LOG', handleGameLog);
+    };
+  }, []);
+
+  useEffect(() => {
+      return () => {
+          if (wsRef.current) wsRef.current.close();
+      };
+  }, []);
+
+  const sendTestGift = (e: React.FormEvent) => {
+    e.preventDefault();
+    const gift = AVAILABLE_GIFTS.find(g => g.id === testGift);
+    if (!gift) return;
+
+    const event: GiftEvent = {
+        id: Math.random().toString(36).substr(2,9),
+        type: 'gift',
+        username: testUser,
+        giftId: gift.id,
+        giftName: gift.name,
+        quantity: Number(testQty),
+        timestamp: Date.now()
+    };
+    
+    // Simulate incoming TikTok Event
+    bus.emit('RAW_EVENT', event);
+  };
+
+  const addTrigger = () => {
+      setTriggers([...triggers, {
+          id: Math.random().toString(36).substr(2,9),
+          giftId: 'rose', giftName: 'Rose', command: 'enemy_spawn', value: 1, cooldown: 1000, enabled: true
+      }]);
+  };
+
+  const updateTrigger = (id: string, field: keyof TriggerRule, value: any) => {
+      setTriggers(triggers.map(t => {
+          if (t.id === id) {
+              const updated = { ...t, [field]: value };
+              if (field === 'giftId') {
+                  const gift = AVAILABLE_GIFTS.find(g => g.id === value);
+                  if (gift) updated.giftName = gift.name;
+              }
+              return updated;
+          }
+          return t;
+      }));
+  };
+
+  const removeTrigger = (id: string) => {
+      setTriggers(triggers.filter(t => t.id !== id));
+  };
+
+  const toggleTikTokConnection = () => {
+      if (connectionStatus === 'live' || connectionStatus === 'connecting') {
+          if (wsRef.current) wsRef.current.close();
+          setConnectionStatus('ready');
+          bus.emit('SYSTEM_LOG', { type: 'info', message: 'Disconnected from TikTok Bridge.' });
+          return;
+      }
+
+      if (!liveUsername) {
+          bus.emit('SYSTEM_LOG', { type: 'error', message: 'Please enter a TikTok username.' });
+          return;
+      }
+
+      setConnectionStatus('connecting');
+      bus.emit('SYSTEM_LOG', { type: 'info', message: `Connecting to bridge for @${liveUsername}...` });
+
+      try {
+          // Menyambung ke Node.js Bridge tempatan
+          const ws = new WebSocket('ws://localhost:8080');
+          wsRef.current = ws;
+
+          ws.onopen = () => {
+              bus.emit('SYSTEM_LOG', { type: 'info', message: 'Bridge connected. Waiting for stream...' });
+              // Arahkan bridge untuk monitor username ini
+              ws.send(JSON.stringify({ type: 'connect', username: liveUsername }));
+          };
+
+          ws.onmessage = (event) => {
+              try {
+                  const data = JSON.parse(event.data);
+                  
+                  if (data.type === 'connected') {
+                      setConnectionStatus('live');
+                      bus.emit('SYSTEM_LOG', { type: 'info', message: `Successfully connected to @${liveUsername}'s LIVE!` });
+                  }
+                  
+                  if (data.type === 'gift') {
+                      // Normalize nama gift dari TikTok ke sistem demo kita
+                      let mappedGiftId = 'rose'; 
+                      const lowerName = data.giftName.toLowerCase();
+                      if (lowerName.includes('heart')) mappedGiftId = 'heart';
+                      else if (lowerName.includes('lion')) mappedGiftId = 'lion';
+                      else if (lowerName.includes('universe')) mappedGiftId = 'universe';
+                      else if (lowerName.includes('coffee')) mappedGiftId = 'coffee';
+
+                      const giftEvent: GiftEvent = {
+                          id: Math.random().toString(36).substr(2,9),
+                          type: 'gift',
+                          username: data.uniqueId || data.nickname,
+                          giftId: mappedGiftId, 
+                          giftName: data.giftName,
+                          quantity: data.repeatCount || 1,
+                          timestamp: Date.now()
+                      };
+                      bus.emit('RAW_EVENT', giftEvent);
+                  }
+
+                  if (data.type === 'error') {
+                      bus.emit('SYSTEM_LOG', { type: 'error', message: `Bridge Error: ${data.message}` });
+                      setConnectionStatus('ready');
+                  }
+              } catch (e) {
+                  console.error("WS Parse error", e);
+              }
+          };
+
+          ws.onclose = () => {
+              if (wsRef.current === ws) {
+                  setConnectionStatus('ready');
+                  bus.emit('SYSTEM_LOG', { type: 'error', message: 'Bridge connection closed.' });
+              }
+          };
+          
+          ws.onerror = () => {
+               bus.emit('SYSTEM_LOG', { type: 'error', message: 'WebSocket Error: Pastikan Node.js Bridge sedang berjalan di terminal (port 8080).' });
+               setConnectionStatus('ready');
+          }
+
+      } catch (e: any) {
+          bus.emit('SYSTEM_LOG', { type: 'error', message: `Connection failed: ${e.message}` });
+          setConnectionStatus('ready');
+      }
+  };
+
+  const toggleFullscreen = () => {
+      if (!document.fullscreenElement) {
+          document.documentElement.requestFullscreen().catch(err => {
+              alert(`Error attempting to enable fullscreen: ${err.message}`);
+          });
+      } else {
+          document.exitFullscreen();
+      }
+  };
+
+  useEffect(() => {
+    const handleFsChange = () => setIsFullscreen(!!document.fullscreenElement);
+    document.addEventListener('fullscreenchange', handleFsChange);
+    return () => document.removeEventListener('fullscreenchange', handleFsChange);
+  }, []);
+
+
+  const exportSettings = () => {
+      const data = JSON.stringify({ triggers, version: 1 }, null, 2);
+      const blob = new Blob([data], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'live-trigger-settings.json';
+      a.click();
+      URL.revokeObjectURL(url);
+  };
+
+
+  if (isFullscreen) {
+      return (
+          <div className="w-screen h-screen bg-black overflow-hidden relative">
+              <canvas ref={canvasRef} className="w-full h-full block" />
+              <button 
+                  onClick={toggleFullscreen}
+                  className="absolute top-4 right-4 bg-gray-900/80 p-2 rounded-lg text-white hover:bg-gray-800 transition-colors"
+              >
+                  <Maximize size={20} />
+              </button>
+          </div>
+      );
+  }
+
+  return (
+    <div className="min-h-screen bg-black text-gray-300 font-sans p-4 flex flex-col gap-4 overflow-hidden h-screen">
+      
+      {/* Header */}
+      <header className="flex items-center justify-between bg-gray-900 border border-gray-800 p-4 rounded-xl shrink-0">
+        <div className="flex items-center gap-3">
+          <div className="w-10 h-10 bg-indigo-600 rounded-lg flex items-center justify-center shadow-lg shadow-indigo-600/20">
+            <Activity className="text-white" size={24} />
+          </div>
+          <div>
+            <h1 className="text-xl font-bold text-white tracking-tight">LIVE TRIGGER STUDIO</h1>
+            <p className="text-xs text-gray-500">Interactive Stream Event Manager</p>
+          </div>
+        </div>
+        
+        <div className="flex items-center gap-4">
+            <div className="flex items-center gap-2 bg-gray-950 px-3 py-1.5 rounded-full border border-gray-800">
+                <div className={`w-2.5 h-2.5 rounded-full ${
+                    connectionStatus === 'live' ? 'bg-green-500 animate-pulse' : 
+                    connectionStatus === 'connecting' ? 'bg-yellow-500 animate-pulse' : 'bg-blue-500'
+                }`}></div>
+                <span className="text-xs font-medium uppercase tracking-wider">
+                    {connectionStatus === 'live' ? 'LIVE CONNECTED' : 
+                     connectionStatus === 'connecting' ? 'CONNECTING...' : 'EVENT ENGINE READY'}
+                </span>
+            </div>
+            <button onClick={exportSettings} className="p-2 text-gray-400 hover:text-white hover:bg-gray-800 rounded-lg transition-colors" title="Export Settings">
+                <Download size={18} />
+            </button>
+        </div>
+      </header>
+
+      {/* Main Grid */}
+      <div className="grid grid-cols-12 gap-4 flex-1 min-h-0">
+        
+        {/* Left Column: Triggers & Test */}
+        <div className="col-span-12 lg:col-span-4 xl:col-span-3 flex flex-col gap-4 min-h-0">
+            
+            {/* TikTok Connection Panel */}
+            <div className="shrink-0">
+                <Panel title="TIKTOK LIVE CONNECTION" icon={Power}>
+                    <div className="flex flex-col gap-3">
+                        <div>
+                            <label className="block text-xs text-gray-500 mb-1">TikTok Username (@)</label>
+                            <input 
+                                type="text" 
+                                placeholder="Cth: khaby.lame"
+                                value={liveUsername} onChange={e => setLiveUsername(e.target.value)}
+                                disabled={connectionStatus !== 'ready'}
+                                className="w-full bg-gray-950 border border-gray-700 rounded p-2 text-sm text-white focus:border-indigo-500 focus:outline-none disabled:opacity-50"
+                            />
+                        </div>
+                        <button 
+                            onClick={toggleTikTokConnection}
+                            className={`w-full font-medium py-2 rounded-lg transition-colors flex items-center justify-center gap-2 ${
+                                connectionStatus === 'live' ? 'bg-red-600 hover:bg-red-700 text-white' : 
+                                connectionStatus === 'connecting' ? 'bg-yellow-600 cursor-not-allowed text-white' : 
+                                'bg-indigo-600 hover:bg-indigo-700 text-white'
+                            }`}
+                        >
+                            <Power size={16} /> 
+                            {connectionStatus === 'live' ? 'Disconnect' : 
+                             connectionStatus === 'connecting' ? 'Connecting...' : 'Connect to Live'}
+                        </button>
+                        <div className="text-[10px] text-gray-500 mt-1 leading-tight">
+                            *Memerlukan <code className="text-gray-400">server.js</code> bridge dijalankan di terminal (Port 8080)
+                        </div>
+                    </div>
+                </Panel>
+            </div>
+
+            {/* Test Gift Panel */}
+            <div className="shrink-0">
+                <Panel title="MOCK EVENT (TEST)" icon={Gamepad2}>
+                    <form onSubmit={sendTestGift} className="flex flex-col gap-3">
+                        <div className="grid grid-cols-2 gap-2">
+                            <div>
+                                <label className="block text-xs text-gray-500 mb-1">Username</label>
+                                <input 
+                                    type="text" 
+                                    value={testUser} onChange={e => setTestUser(e.target.value)}
+                                    className="w-full bg-gray-950 border border-gray-700 rounded p-2 text-sm text-white focus:border-indigo-500 focus:outline-none"
+                                />
+                            </div>
+                            <div>
+                                <label className="block text-xs text-gray-500 mb-1">Quantity</label>
+                                <input 
+                                    type="number" min="1" max="1000"
+                                    value={testQty} onChange={e => setTestQty(Number(e.target.value))}
+                                    className="w-full bg-gray-950 border border-gray-700 rounded p-2 text-sm text-white focus:border-indigo-500 focus:outline-none"
+                                />
+                            </div>
+                        </div>
+                        <div>
+                            <label className="block text-xs text-gray-500 mb-1">Select Gift</label>
+                            <select 
+                                value={testGift} onChange={e => setTestGift(e.target.value)}
+                                className="w-full bg-gray-950 border border-gray-700 rounded p-2 text-sm text-white focus:border-indigo-500 focus:outline-none"
+                            >
+                                {AVAILABLE_GIFTS.map(g => (
+                                    <option key={g.id} value={g.id}>{g.icon} {g.name}</option>
+                                ))}
+                            </select>
+                        </div>
+                        <button type="submit" className="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-medium py-2 rounded-lg transition-colors flex items-center justify-center gap-2">
+                            <Play size={16} fill="currentColor" /> Send Mock Event
+                        </button>
+                    </form>
+                </Panel>
+            </div>
+
+            {/* Trigger Rules Panel */}
+            <div className="flex-1 min-h-0">
+                <Panel 
+                    title="TRIGGER RULES" 
+                    icon={Settings}
+                    action={
+                        <button onClick={addTrigger} className="text-xs bg-gray-800 hover:bg-gray-700 px-2 py-1 rounded flex items-center gap-1 transition-colors">
+                            <Plus size={14} /> Add
+                        </button>
+                    }
+                >
+                    <div className="flex flex-col gap-3">
+                        {triggers.length === 0 ? (
+                            <div className="text-center text-gray-500 text-sm py-4">No triggers configured.</div>
+                        ) : triggers.map((rule, idx) => (
+                            <div key={rule.id} className={`bg-gray-950 border rounded-lg p-3 relative group ${rule.enabled ? 'border-gray-700' : 'border-gray-800 opacity-60'}`}>
+                                <div className="flex items-center justify-between mb-2">
+                                    <div className="flex items-center gap-2">
+                                        <input 
+                                            type="checkbox" 
+                                            checked={rule.enabled} 
+                                            onChange={e => updateTrigger(rule.id, 'enabled', e.target.checked)}
+                                            className="w-4 h-4 rounded bg-gray-900 border-gray-700 text-indigo-600 focus:ring-indigo-600 focus:ring-offset-gray-900"
+                                        />
+                                        <span className="text-xs font-semibold text-gray-400">RULE #{idx + 1}</span>
+                                    </div>
+                                    <button onClick={() => removeTrigger(rule.id)} className="text-gray-500 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity">
+                                        <Trash2 size={14} />
+                                    </button>
+                                </div>
+                                <div className="grid grid-cols-2 gap-2 text-sm">
+                                    <select value={rule.giftId} onChange={e => updateTrigger(rule.id, 'giftId', e.target.value)} className="bg-gray-900 border border-gray-800 rounded p-1.5 w-full">
+                                        {AVAILABLE_GIFTS.map(g => <option key={g.id} value={g.id}>{g.name}</option>)}
+                                    </select>
+                                    <select value={rule.command} onChange={e => updateTrigger(rule.id, 'command', e.target.value)} className="bg-gray-900 border border-gray-800 rounded p-1.5 w-full text-indigo-400 font-medium">
+                                        {AVAILABLE_COMMANDS.map(c => <option key={c} value={c}>{c}</option>)}
+                                    </select>
+                                    <div className="flex items-center gap-1 bg-gray-900 border border-gray-800 rounded px-2">
+                                        <span className="text-xs text-gray-500 w-8">Val:</span>
+                                        <input type="number" value={rule.value} onChange={e => updateTrigger(rule.id, 'value', Number(e.target.value))} className="bg-transparent w-full p-1 outline-none text-right" />
+                                    </div>
+                                    <div className="flex items-center gap-1 bg-gray-900 border border-gray-800 rounded px-2" title="Cooldown (ms)">
+                                        <span className="text-xs text-gray-500 w-8">CD:</span>
+                                        <input type="number" step="100" value={rule.cooldown} onChange={e => updateTrigger(rule.id, 'cooldown', Number(e.target.value))} className="bg-transparent w-full p-1 outline-none text-right" />
+                                    </div>
+                                </div>
+                            </div>
+                        ))}
+                    </div>
+                </Panel>
+            </div>
+        </div>
+
+        {/* Center/Right Column: Preview & Console */}
+        <div className="col-span-12 lg:col-span-8 xl:col-span-9 flex flex-col gap-4 min-h-0">
+            
+            {/* Game Preview Panel */}
+            <div className="flex-1 min-h-0 bg-gray-900 border border-gray-800 rounded-xl overflow-hidden relative shadow-lg group">
+                <canvas ref={canvasRef} className="w-full h-full block" />
+                
+                {/* Overlay Controls */}
+                <div className="absolute top-4 right-4 flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                    <button onClick={() => gameRef.current?.reset()} className="bg-gray-900/80 hover:bg-gray-800 p-2 rounded-lg backdrop-blur text-white transition-colors" title="Reset Game">
+                        <RefreshCw size={18} />
+                    </button>
+                    <button onClick={toggleFullscreen} className="bg-gray-900/80 hover:bg-gray-800 p-2 rounded-lg backdrop-blur text-white transition-colors" title="Fullscreen">
+                        <Maximize size={18} />
+                    </button>
+                </div>
+                
+                {/* Fake "Live" overlay */}
+                <div className="absolute top-4 left-4 flex gap-2">
+                    <div className="bg-red-500 text-white text-xs font-bold px-2 py-1 rounded-md animate-pulse shadow-lg shadow-red-500/20">
+                        LIVE PREVIEW
+                    </div>
+                </div>
+            </div>
+
+            {/* Event Console Panel */}
+            <div className="h-64 shrink-0">
+                <Panel 
+                    title="EVENT CONSOLE" 
+                    icon={MessageSquare}
+                    action={
+                        <button onClick={() => setLogs([])} className="text-xs text-gray-500 hover:text-white transition-colors">Clear</button>
+                    }
+                >
+                    <div className="font-mono text-xs flex flex-col gap-1">
+                        {logs.length === 0 ? (
+                            <div className="text-gray-600 italic">Listening for events...</div>
+                        ) : logs.map((log) => {
+                            let colorClass = 'text-gray-400';
+                            if (log.type === 'trigger') colorClass = 'text-indigo-400 font-semibold';
+                            if (log.type === 'command') colorClass = 'text-green-400';
+                            if (log.type === 'error') colorClass = 'text-red-400';
+                            if (log.type === 'game') colorClass = 'text-yellow-400/70';
+
+                            return (
+                                <div key={log.id} className="flex gap-3 border-b border-gray-800/50 pb-1">
+                                    <span className="text-gray-600 shrink-0">[{log.time}]</span>
+                                    <span className={`${colorClass} break-all`}>{log.message}</span>
+                                </div>
+                            );
+                        })}
+                    </div>
+                </Panel>
+            </div>
+
+        </div>
+
+      </div>
+      
+      {/* Footer styles */}
+      <style dangerouslySetInnerHTML={{__html: `
+        .custom-scrollbar::-webkit-scrollbar { width: 6px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #374151; border-radius: 4px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #4b5563; }
+      `}} />
+    </div>
+  );
+}
